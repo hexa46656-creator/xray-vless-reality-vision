@@ -19,10 +19,11 @@ SHADOWROCKET_CONF_SRC="default.conf"
 SHADOWROCKET_CONF_DST="/root/shadowrocket-default.conf"
 
 XRAY_PORT="${XRAY_PORT:-8443}"
-REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.microsoft.com}"
-REALITY_DEST="${REALITY_DEST:-www.microsoft.com:443}"
+REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
+REALITY_DEST="${REALITY_DEST:-www.cloudflare.com:443}"
+REALITY_DNS_STRICT="${REALITY_DNS_STRICT:-warn}"
 CLIENT_NAME="${CLIENT_NAME:-Xray-Reality}"
-DEPLOY_USER="${DEPLOY_USER:-vpn}"
+DEPLOY_USER="${DEPLOY_USER:-alex}"
 DEPLOY_USER_PASSWORD="${DEPLOY_USER_PASSWORD:-}"
 
 log() {
@@ -76,12 +77,68 @@ detect_ssh_port() {
   log "Detected SSH port: ${SSH_PORT}"
 }
 
+extract_reality_dest_host() {
+  local dest="${1:-${REALITY_DEST}}"
+
+  if [[ "${dest}" =~ ^\[([0-9A-Fa-f:.]+)\]:(.+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  if [[ "${dest}" == *:* ]]; then
+    printf '%s\n' "${dest%:*}"
+    return 0
+  fi
+
+  printf '%s\n' "${dest}"
+}
+
+check_reality_dns_health() {
+  local dest_host
+  local system_dns
+  local cloudflare_dns
+  local google_dns
+  local mismatch=0
+
+  dest_host="$(extract_reality_dest_host "${REALITY_DEST}")"
+  system_dns="$(dig +short A "${dest_host}" 2>/dev/null | awk 'NR==1 {print $1}')"
+  cloudflare_dns="$(dig +short A "${dest_host}" @1.1.1.1 2>/dev/null | awk 'NR==1 {print $1}')"
+  google_dns="$(dig +short A "${dest_host}" @8.8.8.8 2>/dev/null | awk 'NR==1 {print $1}')"
+
+  log "Reality DNS health for ${dest_host}"
+  log "  system DNS: ${system_dns:-<empty>}"
+  log "  1.1.1.1: ${cloudflare_dns:-<empty>}"
+  log "  8.8.8.8: ${google_dns:-<empty>}"
+
+  if [[ -z "${system_dns}" || -z "${cloudflare_dns}" || -z "${google_dns}" ]]; then
+    warn "One or more Reality DNS lookups returned no A record."
+    mismatch=1
+  fi
+
+  if [[ -n "${system_dns}" && -n "${cloudflare_dns}" && -n "${google_dns}" ]]; then
+    if [[ "$({ printf '%s
+' "${system_dns}" "${cloudflare_dns}" "${google_dns}" | awk 'NF' | sort -u | wc -l | tr -d ' '; })" -gt 1 ]]; then
+      warn "Reality DNS lookups returned different A records across resolvers."
+      mismatch=1
+    fi
+  fi
+
+  if [[ "${dest_host}" != "${REALITY_SERVER_NAME}" ]]; then
+    warn "REALITY_DEST host (${dest_host}) differs from REALITY_SERVER_NAME (${REALITY_SERVER_NAME})."
+    mismatch=1
+  fi
+
+  if [[ "${mismatch}" -ne 0 && "${REALITY_DNS_STRICT}" == "fail" ]]; then
+    error "Reality DNS health check failed under REALITY_DNS_STRICT=fail."
+  fi
+}
+
 install_packages() {
   log "Updating system and installing dependencies..."
   apt update
   DEBIAN_FRONTEND=noninteractive apt upgrade -y
   DEBIAN_FRONTEND=noninteractive apt install -y \
-    curl wget unzip jq socat ufw fail2ban ca-certificates gnupg lsb-release openssl iproute2 sudo
+    curl wget unzip jq socat ufw fail2ban ca-certificates gnupg lsb-release openssl iproute2 sudo dnsutils
 }
 
 backup_file() {
@@ -367,7 +424,7 @@ write_client_info() {
   log "Writing client info: ${CLIENT_INFO}"
 
   local encoded_name
-  encoded_name="$(echo "${CLIENT_NAME}" | sed 's/ /%20/g')"
+  encoded_name="${CLIENT_NAME// /%20}"
 
   VLESS_LINK="vless://${UUID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${encoded_name}"
 
@@ -438,6 +495,9 @@ journalctl -u xray -e --no-pager
 ufw status verbose
 fail2ban-client status sshd
 xray version
+dig ${REALITY_SERVER_NAME} @1.1.1.1
+dig ${REALITY_SERVER_NAME} @8.8.8.8
+dig ${REALITY_SERVER_NAME}
 
 ============================================================
 EOF
@@ -474,6 +534,7 @@ main() {
   configure_ufw
   configure_fail2ban
   install_xray
+  check_reality_dns_health
   generate_values
   write_xray_config
   install_shadowrocket_config
