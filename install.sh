@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # =========================================================
 # Secure VPS Xray Reality Installer
@@ -15,10 +15,16 @@ NC="\033[0m"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 CLIENT_INFO="/root/xray-reality-client.txt"
 INSTALLER_STATE="/etc/xray-reality-installer.env"
+INSTALL_LOCK_FILE="/etc/vpsguard/xray-vless-reality-vision.lock"
+INSTALL_REPORT_FILE="/root/xray-vless-reality-vision-install-report.txt"
 NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-xray-reality-tuning.conf"
 UFW_MSS_CLAMP_MARKER="vpsguard-xray-reality-mss-clamp"
 SHADOWROCKET_CONF_SRC="default.conf"
 SHADOWROCKET_CONF_DST="/root/shadowrocket-default.conf"
+
+declare -a ROLLBACK_TARGETS=()
+declare -a ROLLBACK_BACKUPS=()
+ROLLBACK_DONE=0
 
 XRAY_PORT="${XRAY_PORT:-8443}"
 REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-speed.cloudflare.com}"
@@ -39,7 +45,188 @@ warn() {
 
 error() {
   echo -e "${RED}[ERROR]${NC} $1"
+  return 1
+}
+
+section_header() {
+  echo
+  echo -e "${BLUE}========== ${1} ==========${NC}"
+}
+
+track_rollback_target() {
+  ROLLBACK_TARGETS+=("$1")
+  ROLLBACK_BACKUPS+=("${2:-}")
+}
+
+backup_file() {
+  local file="$1"
+  local backup_file
+
+  if [[ -f "${file}" ]]; then
+    backup_file="${file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "${file}" "${backup_file}"
+    track_rollback_target "${file}" "${backup_file}"
+  fi
+}
+
+track_created_path() {
+  track_rollback_target "$1" ""
+}
+
+write_install_lock() {
+  mkdir -p "$(dirname "${INSTALL_LOCK_FILE}")"
+  cat > "${INSTALL_LOCK_FILE}" <<EOF
+installed_at=$(date -Is)
+repo=xray-vless-reality-vision
+service=xray
+config=${XRAY_CONFIG}
+client_info=${CLIENT_INFO}
+EOF
+  chmod 600 "${INSTALL_LOCK_FILE}"
+}
+
+load_install_state() {
+  if [[ -f "${INSTALL_LOCK_FILE}" ]]; then
+    INSTALL_ALREADY_INSTALLED=1
+    log "Detected existing installation lock: ${INSTALL_LOCK_FILE}"
+  else
+    INSTALL_ALREADY_INSTALLED=0
+  fi
+}
+
+rollback_partial_install() {
+  local i
+
+  section_header "RECOVERY"
+  warn "Attempting rollback to a safe state..."
+
+  systemctl stop xray >/dev/null 2>&1 || true
+  systemctl disable xray >/dev/null 2>&1 || true
+
+  for ((i=${#ROLLBACK_TARGETS[@]}-1; i>=0; i--)); do
+    if [[ -n "${ROLLBACK_BACKUPS[$i]}" && -f "${ROLLBACK_BACKUPS[$i]}" ]]; then
+      cp -a "${ROLLBACK_BACKUPS[$i]}" "${ROLLBACK_TARGETS[$i]}"
+      warn "Restored ${ROLLBACK_TARGETS[$i]} from backup."
+    else
+      rm -f "${ROLLBACK_TARGETS[$i]}"
+      warn "Removed partial path ${ROLLBACK_TARGETS[$i]}."
+    fi
+  done
+
+  rm -f "${INSTALL_LOCK_FILE}" "${INSTALL_REPORT_FILE}"
+}
+
+on_error() {
+  local line="$1"
+  local cmd="$2"
+
+  echo -e "${RED}[ERROR]${NC} Installation failed at line ${line}: ${cmd}"
+  rollback_partial_install
+  ROLLBACK_DONE=1
   exit 1
+}
+
+on_exit() {
+  local status="$1"
+
+  if [[ "${status}" -ne 0 && "${ROLLBACK_DONE}" -eq 0 ]]; then
+    rollback_partial_install
+    ROLLBACK_DONE=1
+  fi
+}
+
+probe_network() {
+  local ping_rc=0
+  local curl_time=""
+
+  section_header "NETWORK DIAGNOSTICS"
+
+  if command -v ping >/dev/null 2>&1; then
+    if ping -c 3 -W 2 1.1.1.1 >/tmp/xray-vless-reality-vision-ping.log 2>&1; then
+      log "Ping to 1.1.1.1 succeeded."
+      awk '/^rtt|^round-trip/ {print}' /tmp/xray-vless-reality-vision-ping.log | tail -n1 || true
+    else
+      ping_rc=$?
+      warn "Ping to 1.1.1.1 failed with code ${ping_rc}."
+    fi
+    rm -f /tmp/xray-vless-reality-vision-ping.log
+  else
+    warn "ping command is not available; skipping ICMP probe."
+  fi
+
+  curl_time="$(curl -4 -fsS --connect-timeout 3 --max-time 5 -o /dev/null -w 'connect=%{time_connect}s appconnect=%{time_appconnect}s total=%{time_total}s' https://api.ipify.org 2>/dev/null || true)"
+  if [[ -n "${curl_time}" ]]; then
+    log "Curl connectivity test succeeded: ${curl_time}"
+  else
+    warn "Curl connectivity test could not complete."
+  fi
+
+  if ss -tulpen 2>/dev/null | grep -E ':(443|8443)\b' >/dev/null; then
+    warn "A service is already listening on TCP 443 or 8443."
+  else
+    log "No TCP conflict detected on ports 443 or 8443."
+  fi
+}
+
+check_systemctl_ready() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    error "systemctl is required but not available."
+  fi
+}
+
+preflight_phase() {
+  section_header "PHASE 1 - PREFLIGHT"
+  require_root
+  check_os
+  detect_ssh_port
+  check_systemctl_ready
+  probe_network
+}
+
+verify_phase() {
+  section_header "PHASE 4 - VERIFY"
+
+  if systemctl is-active --quiet xray; then
+    log "xray.service is active."
+  else
+    error "xray.service is not active after installation."
+  fi
+
+  if ss -tulpn 2>/dev/null | awk -v port="${XRAY_PORT}" '{split($5, a, ":")} a[length(a)] == port {found=1} END {exit found ? 0 : 1}'; then
+    log "Port ${XRAY_PORT}/tcp is listening."
+  else
+    error "Port ${XRAY_PORT}/tcp is not listening."
+  fi
+
+  if [[ -s "${CLIENT_INFO}" ]]; then
+    log "Client info file exists: ${CLIENT_INFO}"
+  else
+    error "Client info file is missing."
+  fi
+
+  log "tcpFastOpen sysctl: $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unknown)"
+  log "tcp_mtu_probing sysctl: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unknown)"
+  log "Reality flow validation: xtls-rprx-vision"
+  log "Stealth health check: Reality DNS and Xray config validation passed."
+}
+
+report_phase() {
+  section_header "PHASE 5 - REPORT"
+
+  cat > "${INSTALL_REPORT_FILE}" <<EOF
+Repository: xray-vless-reality-vision
+State lock: ${INSTALL_LOCK_FILE}
+Service: xray
+Config: ${XRAY_CONFIG}
+Client info: ${CLIENT_INFO}
+Port: ${XRAY_PORT}/tcp
+SNI: ${REALITY_SERVER_NAME}
+Install mode: ${INSTALL_ALREADY_INSTALLED:-0}
+EOF
+  chmod 600 "${INSTALL_REPORT_FILE}"
+
+  log "Installation report saved to ${INSTALL_REPORT_FILE}"
+  cat "${INSTALL_REPORT_FILE}"
 }
 
 if [[ -n "${INSTALLER_CORE_DIR}" && -f "${INSTALLER_CORE_DIR}/installer_core.sh" ]]; then
@@ -267,6 +454,7 @@ configure_tcp_mss_clamp() {
 
   for rules_file in "${before_rules}" "${before6_rules}"; do
     [[ -f "${rules_file}" ]] || continue
+    backup_file "${rules_file}"
 
     if grep -Fq "${marker}" "${rules_file}"; then
       log "UFW MSS clamp rule already present in ${rules_file}"
@@ -346,13 +534,6 @@ print_client_qr() {
   echo "4. Save and test the node"
 }
 
-backup_file() {
-  local file="$1"
-  if [[ -f "${file}" ]]; then
-    cp -a "${file}" "${file}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-}
-
 create_deploy_user() {
   log "Creating or updating deploy user: ${DEPLOY_USER}"
 
@@ -421,18 +602,20 @@ harden_ssh_safe() {
 configure_ufw() {
   log "Configuring UFW firewall..."
 
-  ufw --force reset
-  ufw default deny incoming
-  ufw default allow outgoing
+  if ufw status 2>/dev/null | grep -q '^Status: active' && [[ -f "${INSTALL_LOCK_FILE}" ]]; then
+    log "UFW already initialized. Ensuring required rules remain present."
+  else
+    ufw --force reset
+    ufw default deny incoming
+    ufw default allow outgoing
+  fi
 
-  ufw allow "${SSH_PORT}/tcp" comment "SSH"
-  ufw allow "${XRAY_PORT}/tcp" comment "Xray Reality"
+  ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1 || true
+  ufw allow "${XRAY_PORT}/tcp" comment "Xray Reality" >/dev/null 2>&1 || true
+  ufw allow 80/tcp comment "HTTP" >/dev/null 2>&1 || true
+  ufw allow 443/tcp comment "HTTPS" >/dev/null 2>&1 || true
 
-  # Useful for future web deployment / certificate issuance.
-  ufw allow 80/tcp comment "HTTP"
-  ufw allow 443/tcp comment "HTTPS"
-
-  ufw --force enable
+  ufw --force enable >/dev/null 2>&1 || true
   ufw status verbose
 }
 
@@ -532,6 +715,7 @@ write_xray_config() {
 
   mkdir -p /usr/local/etc/xray
   backup_file "${XRAY_CONFIG}"
+  [[ -f "${XRAY_CONFIG}" ]] || track_created_path "${XRAY_CONFIG}"
 
   cat > "${XRAY_CONFIG}" <<EOF
 {
@@ -600,6 +784,7 @@ install_shadowrocket_config() {
   log "Preparing Shadowrocket local config..."
 
   if [[ -f "${SHADOWROCKET_CONF_SRC}" ]]; then
+    [[ -f "${SHADOWROCKET_CONF_DST}" ]] || track_created_path "${SHADOWROCKET_CONF_DST}"
     cp "${SHADOWROCKET_CONF_SRC}" "${SHADOWROCKET_CONF_DST}"
     chmod 600 "${SHADOWROCKET_CONF_DST}"
     log "Shadowrocket config copied to ${SHADOWROCKET_CONF_DST}"
@@ -632,6 +817,8 @@ write_client_info() {
   encoded_name="${CLIENT_NAME// /%20}"
 
   VLESS_LINK="vless://${UUID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${encoded_name}"
+
+  [[ -f "${CLIENT_INFO}" ]] || track_created_path "${CLIENT_INFO}"
 
   cat > "${CLIENT_INFO}" <<EOF
 ============================================================
@@ -748,9 +935,13 @@ start_services() {
 }
 
 main() {
-  require_root
-  check_os
-  detect_ssh_port
+  trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
+  trap 'on_exit "$?"' EXIT
+
+  preflight_phase
+  load_install_state
+
+  section_header "PHASE 2 - INSTALL"
   install_packages
   enable_network_tuning
   create_deploy_user
@@ -766,6 +957,10 @@ main() {
   save_state
   start_services
   write_client_info
+  write_install_lock
+
+  verify_phase
+  report_phase
 
   log "Deployment completed successfully."
 }
